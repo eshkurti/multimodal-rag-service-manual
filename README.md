@@ -88,12 +88,12 @@ OCR-augmented multimodal retrieval more than doubled the accuracy of text-only R
 ### Installation
 
 ```bash
-git clone https://github.com/your-username/bmw-service-manual-multimodal-rag.git
-cd bmw-service-manual-multimodal-rag
+git clone https://github.com/eshkurti/multimodal-rag-service-manual.git
+cd multimodal-rag-service-manual
 
 python -m venv .venv
-source .venv/bin/activate        # Linux/macOS
-# .venv\Scripts\activate         # Windows
+.venv\Scripts\activate         # Windows
+# source .venv/bin/activate        # Linux/macOS
 
 pip install -r requirements.txt
 
