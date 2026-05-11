@@ -1,0 +1,230 @@
+RAG_chat.py:
+import os
+import time
+import pickle
+import numpy as np
+from dotenv import load_dotenv
+from data.serviceManual_data import manual_database, title_to_file
+from core.model_map import MODEL_MAP as FULL_MODEL_MAP
+from core.llm_interface import call_llm, call_embedding
+
+load_dotenv()
+
+EMBEDDING_MODEL = "text-embedding-3-small"
+EMBEDDING_CACHE = os.path.join("data", "manual_embeddings.pkl")
+BATCH_SIZE = 100
+SLEEP_PER_BATCH = 0.1
+
+SYSTEM_PROMPT = (
+    "You are a helpful assistant answering questions based on the 2013 BMW 335i Convertible (E93) "
+    "L6-3.0L Turbo (N55)."
+    "If you don't know the answer, say: "
+    "\"Sorry, I don't know the answer to that question. Please consult the service manual.\""
+)
+
+def save_cache(path: str, obj: dict):
+    with open(path, "wb") as f:
+        pickle.dump(obj, f)
+
+def load_cache(path: str):
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    return None
+
+def batch_embeddings(texts, model=EMBEDDING_MODEL):
+    embeddings = []
+    for i in range(0, len(texts), BATCH_SIZE):
+        batch = texts[i:i + BATCH_SIZE]
+        batch_embs = call_embedding(batch, model=model)
+        embeddings.extend(batch_embs)
+        time.sleep(SLEEP_PER_BATCH)
+    return embeddings
+
+def get_or_build_corpus_embeddings(manual_database, cache_file=EMBEDDING_CACHE):
+    """
+    Build embeddings using full page content (title + text) for similarity search.
+
+    Returns:
+        {title: embedding}
+    """
+    corpus_keys = list(manual_database.keys())
+    cache = load_cache(cache_file)
+
+    if cache and set(cache.keys()) == set(corpus_keys):
+        return {k: np.array(v, dtype=np.float32) for k, v in cache.items()}
+
+    print(f"Building embeddings for {len(corpus_keys)} items (this may take a while)...")
+    texts_to_embed = [f"{title}\n\n{manual_database[title]}" for title in corpus_keys]
+    embeddings = batch_embeddings(texts_to_embed)
+
+    vector_db = {corpus_keys[i]: embeddings[i] for i in range(len(corpus_keys))}
+    save_cache(cache_file, {k: v.tolist() for k, v in vector_db.items()})
+    return vector_db
+
+def embedding_model(query, model=EMBEDDING_MODEL):
+    return call_embedding(query, model=model)[0]
+
+def find_top_k_similar_faq(query_embedding: np.ndarray, vector_db: dict, k: int = 5, min_sim: float = 0.5):
+    keys = list(vector_db.keys())
+    mat = np.vstack([vector_db[k] for k in keys])
+    sims = mat.dot(query_embedding)
+    valid_idx = np.where(sims >= min_sim)[0]
+    if valid_idx.size == 0:
+        return []
+
+    k_eff = min(k, valid_idx.size)
+    top_unsorted = valid_idx[np.argpartition(sims[valid_idx], -k_eff)[-k_eff:]]
+    top_sorted = top_unsorted[np.argsort(sims[top_unsorted])[::-1]]
+    return [(keys[i], float(sims[i])) for i in top_sorted]
+
+def rag_chatbot(query, vector_db, title_to_file, model_key="gpt-4o-mini", k: int = 5, min_sim: float = 0.5):
+    query_embedding = embedding_model(query)
+    top_hits = find_top_k_similar_faq(query_embedding, vector_db, k=k, min_sim=min_sim)
+
+    if not top_hits:
+        return "Sorry, I don't know the answer to that question. Please consult the service manual."
+
+    print("\nRanked similarities (with filenames and snippet):")
+    for idx, (q_key, score) in enumerate(top_hits, start=1):
+        label = "Best match" if idx == 1 else f"{idx}."
+        file_name = title_to_file.get(q_key, "Unknown file")
+        ans = manual_database.get(q_key, "")
+        snippet = ans.replace("\n", " ")[:300] + ("..." if len(ans) > 300 else "")
+        print(f"{label} {q_key} (score={score:.4f}) — file: {file_name}")
+        print(f"Snippet: {snippet}\n")
+
+    show_debug = input("\nShow full prompt before request? (y/n): ").strip().lower() == "y"
+
+    blocks = []
+    for q_key, _ in top_hits:
+        ans = manual_database.get(q_key, "")
+        if ans:
+            blocks.append(f"Q: {q_key}\nA: {ans}")
+
+    context_block = "\n\n---\n\n".join(blocks)
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": "Relevant manual pages (top-k):\n\n" + context_block},
+        {"role": "user", "content": query},
+    ]
+
+    if show_debug:
+        print("\n--- Full prompt (debug) ---\n")
+        for m in messages:
+            print(f"{m['role'].upper()}: {m['content']}\n")
+        print("--- End prompt ---\n")
+
+    return call_llm(messages, model=model_key)
+
+# --- MAIN ---
+if __name__ == "__main__":
+    vector_db = get_or_build_corpus_embeddings(manual_database)
+    user_input = input("Please provide your query: \n").strip()
+    print(f"\nUser query: {user_input}\n")
+
+    model_keys = list(FULL_MODEL_MAP.keys())
+    while True:
+        print("Available models:")
+        for i, key in enumerate(model_keys, start=1):
+            info = FULL_MODEL_MAP[key]
+            print(f"{i}. {key} (Provider: {info['provider']}, Model: {info['model_name']})")
+        choice = input("Choose a model by number: ").strip()
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(model_keys):
+                chosen_model_key = model_keys[idx]
+                break
+        print("Invalid choice, please enter a number from the list.")
+
+    answer = rag_chatbot(
+        user_input,
+        vector_db,
+        title_to_file,
+        model_key=chosen_model_key,
+        k=5,
+        min_sim=0.5
+    )
+
+    while True:
+        show_answer = input("\nDo you want to see the model's answer? (y/n): ").strip().lower()
+        if show_answer == "y":
+            print("\n--- Model answer ---\n")
+            print(answer)
+            break
+        else:
+            print("Okay, I'll ask again.")
+
+
+
+
+serviceManual_data.py:
+import os
+from bs4 import BeautifulSoup
+
+PAGES_DIR = os.path.join(
+    os.path.dirname(__file__),
+    "..",
+    "2013 BMW 335i Convertible (E93) L6-3.0L Turbo (N55)",
+    "pages"
+)
+
+def load_manual_database():
+    """
+    Loads and cleans the BMW service manual HTML pages into a dictionary for RAG retrieval.
+
+    Returns:
+        db (dict): {title: cleaned content}
+        title_to_file (dict): {title: filename.html}
+    """
+    db = {}
+    title_to_file = {}
+
+    for filename in os.listdir(PAGES_DIR):
+        if not filename.endswith(".html"):
+            continue
+
+        path = os.path.join(PAGES_DIR, filename)
+        with open(path, "r", encoding="utf-8") as f:
+            soup = BeautifulSoup(f, "html.parser")
+
+            # Page title from <h1> (fallback to filename if missing)
+            h1 = soup.find("h1")
+            title = h1.get_text(strip=True) if h1 else filename
+
+            main_div = soup.find("div", class_="main")
+            content_parts = []
+
+            if main_div:
+                # Remove clutter elements
+                for tag in main_div.select("button, img, script, style, link, ul, li"):
+                    tag.decompose()
+
+                # Remove purely layout spans
+                for span in main_div.select("span.indent-right-align"):
+                    span.unwrap()
+
+                # Replace <br> with newlines
+                for br in main_div.find_all("br"):
+                    br.replace_with("\n")
+
+                # Get cleaned text
+                text_content = main_div.get_text(separator="\n", strip=True)
+                if text_content:
+                    content_parts.append(text_content)
+
+            # Join parts
+            content = "\n\n".join(content_parts) if content_parts else ""
+
+            # Skip pages with almost no content
+            if len(content) < 50:
+                continue
+
+            db[title] = content
+            title_to_file[title] = filename
+
+    return db, title_to_file
+
+
+manual_database, title_to_file = load_manual_database()
